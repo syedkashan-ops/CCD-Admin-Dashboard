@@ -7,10 +7,10 @@ import requests
 import streamlit as st
 import pydeck as pdk
 
-st.set_page_config(page_title="CCD | Admin V1.7", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="CCD | Admin V1.8", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
 st.markdown('''<style>.block-container{padding-top:1rem;max-width:1450px}h1,h2,h3{color:#084a82}div[data-testid="stMetric"]{border:1px solid #dce6ef;border-radius:12px;padding:12px;background:#f8fbff}div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px} .stButton>button[kind="primary"]{background:#00815d;border:0}@media(max-width:700px){.block-container{padding:0.7rem}.stDataFrame{font-size:12px}}</style>''', unsafe_allow_html=True)
 st.title("CUSTOMER CARE DAY")
-st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V1.7 | Pakistan Standard Time (PKT)")
+st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V1.8 | Pakistan Standard Time (PKT)")
 
 required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "ADMIN_PASSWORD"]
 missing = [key for key in required if not st.secrets.get(key)]
@@ -200,7 +200,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True)
 
-st.subheader("🗺️ Visit GPS map — V1.7")
+st.subheader("🗺️ Visit GPS map — V1.8")
 st.caption("Select one visit to compare its actual outlet, GPS IN and GPS OUT coordinates. Lines connect available recorded points only; they do not represent travel routes.")
 
 def find_geo_pair(columns, prefixes):
@@ -288,7 +288,7 @@ else:
             focus_choices.append("Focus on outlet")
         if "GPS IN" in by_role or "GPS OUT" in by_role:
             focus_choices.append("Focus on employee")
-        mode = st.radio("Map view", focus_choices, horizontal=True, key="gps_focus_v17")
+        mode = st.radio("Map view", focus_choices, horizontal=True, key="gps_focus_v18")
 
         # Zoom-to-fit uses longitude corrected for latitude, with conservative
         # padding for narrow mobile screens. Do not infer missing locations.
@@ -323,12 +323,55 @@ else:
                 p, q = by_role[first], by_role[second]
                 links.append({"source":[p["lon"],p["lat"]],
                               "target":[q["lon"],q["lat"]], "color":color})
+        # V1.8: visually group nearby IN/OUT points at wide-area zoom.
+        # The grouped marker is a display-only midpoint, never a replacement
+        # for the true GPS coordinates stored in Supabase.
+        from math import sin
+        def gps_distance_m(a, b):
+            dlat = radians(b["lat"] - a["lat"])
+            dlon = radians(b["lon"] - a["lon"])
+            h = sin(dlat / 2)**2 + cos(radians(a["lat"])) * cos(radians(b["lat"])) * sin(dlon / 2)**2
+            return 6371000 * 2 * asin(min(1.0, sqrt(max(0.0, h))))
+
+        close_pair = ("GPS IN" in by_role and "GPS OUT" in by_role and
+                      gps_distance_m(by_role["GPS IN"], by_role["GPS OUT"]) <= 100)
+        group_on_wide = close_pair and mode == "Show all locations"
+        show_cluster = st.checkbox(
+            "Group nearby IN/OUT markers on overview map",
+            value=True, disabled=not group_on_wide,
+            help="Groups IN and OUT only in Show all locations when they are within 100 m. "
+                 "Focus on employee always shows the true separate GPS points.",
+            key="gps_cluster_v18"
+        ) if group_on_wide else False
+
+        if show_cluster:
+            in_pt, out_pt = by_role["GPS IN"], by_role["GPS OUT"]
+            midpoint = {"lat": (in_pt["lat"] + out_pt["lat"]) / 2,
+                        "lon": (in_pt["lon"] + out_pt["lon"]) / 2,
+                        "role": "GPS IN + OUT (grouped)",
+                        "color": [130, 75, 190],
+                        "coordinates": "Tap Focus on employee to see both actual GPS positions",
+                        "employee": in_pt["employee"], "outlet": in_pt["outlet"]}
+            display_points = [p for p in pts if p["role"] not in ("GPS IN", "GPS OUT")] + [midpoint]
+            display_links = []
+            if "Registered outlet" in by_role:
+                outlet = by_role["Registered outlet"]
+                display_links.append({
+                    "source": [outlet["lon"], outlet["lat"]],
+                    "target": [midpoint["lon"], midpoint["lat"]],
+                    "color": [130, 75, 190]})
+            st.info("IN and OUT are grouped on this overview because they are close together. "
+                    "Choose **Focus on employee** to inspect both actual GPS positions.")
+        else:
+            display_points = pts
+            display_links = links
+
         layers = []
-        if links:
-            layers.append(pdk.Layer("LineLayer", data=pd.DataFrame(links),
+        if display_links:
+            layers.append(pdk.Layer("LineLayer", data=pd.DataFrame(display_links),
                 get_source_position="source", get_target_position="target",
                 get_color="color", get_width=3, width_min_pixels=2))
-        layers.append(pdk.Layer("ScatterplotLayer", data=pd.DataFrame(pts),
+        layers.append(pdk.Layer("ScatterplotLayer", data=pd.DataFrame(display_points),
             get_position="[lon, lat]", get_fill_color="color",
             get_radius=65, radius_min_pixels=8, radius_max_pixels=18,
             pickable=True, stroked=True, get_line_color=[255,255,255], line_width_min_pixels=2))
@@ -336,8 +379,8 @@ else:
             map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
             initial_view_state=view, layers=layers,
             tooltip={"html":"<b>{role}</b><br/>{coordinates}<br/>Employee: {employee}<br/>Outlet: {outlet}"}),
-            use_container_width=True, key=f"ccd_gps_map_v17_{mode.replace(' ','_')}")
-        st.markdown("🟢 **Registered outlet** · 🔵 **GPS IN** · 🔴 **GPS OUT**")
+            use_container_width=True, key=f"ccd_gps_map_v18_{mode.replace(' ','_')}_{int(show_cluster)}")
+        st.markdown("🟢 **Registered outlet** · 🔵 **GPS IN** · 🔴 **GPS OUT**" + (" · 🟣 **Grouped IN/OUT**" if show_cluster else ""))
         for p in pts:
             st.write(f"**{p['role']}:** `{p['coordinates']}`")
 
