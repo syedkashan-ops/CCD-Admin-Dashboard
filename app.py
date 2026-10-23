@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 import pydeck as pdk
 
-st.set_page_config(page_title="CCD | Admin V2.0", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="CCD | Admin V2.8", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
 st.markdown('''<style>.block-container{padding-top:1rem;max-width:1450px}h1,h2,h3{color:#084a82}div[data-testid="stMetric"]{border:1px solid #dce6ef;border-radius:12px;padding:12px;background:#f8fbff}div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px} .stButton>button[kind="primary"]{background:#00815d;border:0}@media(max-width:700px){.block-container{padding:0.7rem}.stDataFrame{font-size:12px}}</style>''', unsafe_allow_html=True)
 st.title("CUSTOMER CARE DAY")
 st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V2.8 | Pakistan Standard Time (PKT)")
@@ -339,7 +339,9 @@ report["visit_status"] = complete.map({True:"Completed", False:"Incomplete"})
 preferred = ["employee_code", "employee_name", "outlet_code", "outlet_name", "visit_status",
              "in_time_pkt", "out_time_pkt", "time_spent_hhmmss", "time_spent_hours",
              "in_outlet_distance_m", "out_outlet_distance_m", "in_out_distance_m",
-             "in_out_distance_status", "outlet_gps_status", "in_accuracy_m", "out_accuracy_m", "visit_id"]
+             "in_out_distance_status", "outlet_gps_status", "in_accuracy_m", "out_accuracy_m", "visit_id",
+             "Device ID", "Android ID Hash", "Device Manufacturer", "Device Model",
+             "Distinct Employees on Device", "Distinct Employees on Android ID", "Device Audit Status"]
 # Include any latitude/longitude fields if present in the V1.2 SQL view.
 geo_fields = [c for c in report.columns if any(word in c.lower() for word in ("latitude", "longitude", "_lat", "_lon", "_lng"))]
 preferred += [c for c in geo_fields if c not in preferred]
