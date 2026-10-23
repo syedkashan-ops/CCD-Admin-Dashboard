@@ -7,10 +7,10 @@ import requests
 import streamlit as st
 import pydeck as pdk
 
-st.set_page_config(page_title="CCD | Admin V1.6", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="CCD | Admin V1.7", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
 st.markdown('''<style>.block-container{padding-top:1rem;max-width:1450px}h1,h2,h3{color:#084a82}div[data-testid="stMetric"]{border:1px solid #dce6ef;border-radius:12px;padding:12px;background:#f8fbff}div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px} .stButton>button[kind="primary"]{background:#00815d;border:0}@media(max-width:700px){.block-container{padding:0.7rem}.stDataFrame{font-size:12px}}</style>''', unsafe_allow_html=True)
 st.title("CUSTOMER CARE DAY")
-st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V1.6 | Pakistan Standard Time (PKT)")
+st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V1.7 | Pakistan Standard Time (PKT)")
 
 required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "ADMIN_PASSWORD"]
 missing = [key for key in required if not st.secrets.get(key)]
@@ -200,7 +200,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True)
 
-st.subheader("🗺️ Visit GPS map — V1.6")
+st.subheader("🗺️ Visit GPS map — V1.7")
 st.caption("Select one visit to compare its actual outlet, GPS IN and GPS OUT coordinates. Lines connect available recorded points only; they do not represent travel routes.")
 
 def find_geo_pair(columns, prefixes):
@@ -235,6 +235,21 @@ else:
     selected_idx = st.selectbox("Select visit to map", list(range(len(candidates))),
                                 format_func=visit_label, key="gps_map_visit")
     visit = candidates.iloc[selected_idx]
+    # V1.2 reporting view exposes IN/OUT coordinates, but may omit outlet coordinates.
+    # Retrieve the registered outlet location from the outlet master (read-only, server-side).
+    @st.cache_data(ttl=300, show_spinner=False)
+    def registered_outlet_coordinates(outlet_code):
+        headers = {"apikey": KEY, "Authorization": f"Bearer {KEY}"}
+        response = requests.get(
+            f"{BASE}/rest/v1/outlets",
+            headers=headers,
+            params={"select": "code,name,latitude,longitude",
+                    "code": f"eq.{outlet_code}", "limit": 1},
+            timeout=20)
+        response.raise_for_status()
+        records = response.json()
+        return records[0] if records else None
+
     pts = []
     for label, pair, rgb in geo_pairs:
         if not pair:
@@ -246,12 +261,60 @@ else:
                         "coordinates":f"{float(lat):.6f}, {float(lon):.6f}",
                         "employee":str(visit.get("employee_name", "")),
                         "outlet":str(visit.get("outlet_code", ""))})
+
+    # Fill the outlet marker from the authoritative outlets table when the view omits it.
+    if not any(p["role"] == "Registered outlet" for p in pts):
+        try:
+            master = registered_outlet_coordinates(str(visit.get("outlet_code", "")).strip())
+            if master:
+                lat = pd.to_numeric(master.get("latitude"), errors="coerce")
+                lon = pd.to_numeric(master.get("longitude"), errors="coerce")
+                if pd.notna(lat) and pd.notna(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
+                    pts.insert(0, {"lat":float(lat), "lon":float(lon),
+                                   "role":"Registered outlet", "color":[0,150,95],
+                                   "coordinates":f"{float(lat):.6f}, {float(lon):.6f}",
+                                   "employee":str(visit.get("employee_name","")),
+                                   "outlet":str(visit.get("outlet_code",""))})
+        except Exception as exc:
+            st.warning(f"Could not retrieve registered outlet coordinates from Outlet Master: {exc}")
+
     if not pts:
-        st.warning("No valid coordinates are available for this visit. Choose another visit.")
+        st.warning("No valid GPS coordinates are available for this visit.")
     else:
-        pt_df = pd.DataFrame(pts)
+        from math import log2, cos, radians, asin, sqrt
+        by_role = {p["role"]: p for p in pts}
+        focus_choices = ["Show all locations"]
+        if "Registered outlet" in by_role:
+            focus_choices.append("Focus on outlet")
+        if "GPS IN" in by_role or "GPS OUT" in by_role:
+            focus_choices.append("Focus on employee")
+        mode = st.radio("Map view", focus_choices, horizontal=True, key="gps_focus_v17")
+
+        # Zoom-to-fit uses longitude corrected for latitude, with conservative
+        # padding for narrow mobile screens. Do not infer missing locations.
+        def fit_view(points):
+            lats = [p["lat"] for p in points]
+            lons = [p["lon"] for p in points]
+            midlat = (min(lats) + max(lats)) / 2
+            midlon = (min(lons) + max(lons)) / 2
+            lat_extent = max(lats) - min(lats)
+            lon_extent = (max(lons) - min(lons)) * max(0.15, cos(radians(midlat)))
+            extent = max(lat_extent, lon_extent)
+            # ~300 px usable map width on narrow mobile screens.
+            zoom = max(3.0, min(16.5, log2(0.25 / max(extent, 0.00025)) + 8.0))
+            return pdk.ViewState(latitude=midlat, longitude=midlon, zoom=zoom, pitch=0)
+
+        if mode == "Focus on outlet":
+            visible = [by_role["Registered outlet"]]
+            view = pdk.ViewState(latitude=visible[0]["lat"], longitude=visible[0]["lon"], zoom=15, pitch=0)
+        elif mode == "Focus on employee":
+            visible = [by_role[x] for x in ("GPS IN","GPS OUT") if x in by_role]
+            view = fit_view(visible)
+        else:
+            visible = pts
+            view = fit_view(pts)
+
         links = []
-        by_role = {p["role"]:p for p in pts}
         for first, second, color in [
             ("Registered outlet", "GPS IN", [30,105,225]),
             ("Registered outlet", "GPS OUT", [225,55,65]),
@@ -264,33 +327,42 @@ else:
         if links:
             layers.append(pdk.Layer("LineLayer", data=pd.DataFrame(links),
                 get_source_position="source", get_target_position="target",
-                get_color="color", get_width=4, width_min_pixels=2))
-        layers.append(pdk.Layer("ScatterplotLayer", data=pt_df,
+                get_color="color", get_width=3, width_min_pixels=2))
+        layers.append(pdk.Layer("ScatterplotLayer", data=pd.DataFrame(pts),
             get_position="[lon, lat]", get_fill_color="color",
-            get_radius=65, radius_min_pixels=9, radius_max_pixels=20,
+            get_radius=65, radius_min_pixels=8, radius_max_pixels=18,
             pickable=True, stroked=True, get_line_color=[255,255,255], line_width_min_pixels=2))
-        # Center and zoom to include all available points, including large GPS mismatches.
-        lat_span = float(pt_df.lat.max() - pt_df.lat.min())
-        lon_span = float(pt_df.lon.max() - pt_df.lon.min())
-        span = max(lat_span, lon_span)
-        zoom = max(3, min(16, 12 - __import__("math").log2(max(span, 0.003)/0.02)))
         st.pydeck_chart(pdk.Deck(
             map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-            initial_view_state=pdk.ViewState(latitude=float(pt_df.lat.mean()),
-                longitude=float(pt_df.lon.mean()), zoom=zoom, pitch=0),
-            layers=layers,
+            initial_view_state=view, layers=layers,
             tooltip={"html":"<b>{role}</b><br/>{coordinates}<br/>Employee: {employee}<br/>Outlet: {outlet}"}),
-            use_container_width=True)
+            use_container_width=True, key=f"ccd_gps_map_v17_{mode.replace(' ','_')}")
         st.markdown("🟢 **Registered outlet** · 🔵 **GPS IN** · 🔴 **GPS OUT**")
         for p in pts:
             st.write(f"**{p['role']}:** `{p['coordinates']}`")
+
+        def haversine(a, b):
+            dlat = radians(b["lat"] - a["lat"])
+            dlon = radians(b["lon"] - a["lon"])
+            z = sin_half(dlat)**2 + cos(radians(a["lat"])) * cos(radians(b["lat"])) * sin_half(dlon)**2
+            return 6371000 * 2 * asin(min(1.0, sqrt(max(0.0, z))))
+        def sin_half(x):
+            from math import sin
+            return sin(x / 2)
+
+        if "Registered outlet" in by_role:
+            for role in ("GPS IN", "GPS OUT"):
+                if role in by_role:
+                    st.caption(f"Outlet → {role}: {haversine(by_role['Registered outlet'], by_role[role]):,.1f} m (straight-line GPS distance)")
+        else:
+            st.warning("Registered outlet GPS not available in reporting view or Outlet Master. Verify its master coordinates.")
+
         def distance_text(name):
             v = pd.to_numeric(visit.get(name), errors="coerce")
             return f"{v:,.1f} m" if pd.notna(v) else "Unavailable"
         st.write(f"**IN → outlet:** {distance_text('in_outlet_distance_m')}  |  **OUT → outlet:** {distance_text('out_outlet_distance_m')}")
         st.write(f"**IN → OUT:** {distance_text('in_out_distance_m')}  |  **GPS status:** {visit.get('outlet_gps_status','—')}")
-        if len(pts) < 3:
-            st.caption("Some markers are missing because their coordinates are not available in the reporting view.")
+        st.caption("Connecting lines are straight-line comparisons, not travel routes. Switch map view to inspect distant locations.")
 st.subheader("🏪 Outlet-wise visits")
 if not filtered.empty:
     outlet_report = filtered.groupby(["outlet_code", "outlet_name"], dropna=False).agg(
@@ -327,6 +399,6 @@ def build_excel(visits_json, outlet_json, employee_json, exception_json):
 employee_export = employee_summary if not filtered.empty else pd.DataFrame(columns=["employee_code","employee_name","visits","completed","total_hours","gps_mismatches"])
 excel = build_excel(shown.to_json(orient="records"), outlet_report.to_json(orient="records"),
                     employee_export.to_json(orient="records"), exceptions.to_json(orient="records"))
-st.download_button("⬇️ Download Excel (4 sheets)", excel, file_name=f"CCD_Attendance_V1_6_{now_pkt.isoformat()}.xlsx",
+st.download_button("⬇️ Download Excel (4 sheets)", excel, file_name=f"CCD_Attendance_V1_7_{now_pkt.isoformat()}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
 st.caption("Read-only dashboard. GPS coordinates appear only if included in the Supabase attendance_visit_summary view. Never put server secrets in GitHub.")
