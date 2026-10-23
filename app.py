@@ -757,6 +757,20 @@ def build_excel(visits_json, outlet_json, employee_json, exception_json, audit_j
         for name, content in [("Employee Visits", visits_json), ("Outlet Summary", outlet_json),
                               ("Employee Summary", employee_json), ("GPS Exceptions", exception_json), ("Device Audit", audit_json)]:
             frame = pd.read_json(BytesIO(content.encode()), orient="records")
+            # Excel cannot write timezone-aware datetime objects. The Device Audit
+            # sheet contains UTC timestamps; convert all datetime values to
+            # human-readable PKT strings before writing, including object columns.
+            for column in frame.columns:
+                if isinstance(frame[column].dtype, pd.DatetimeTZDtype):
+                    frame[column] = frame[column].dt.tz_convert("Asia/Karachi").dt.strftime("%d %b %Y, %I:%M:%S %p PKT")
+                elif pd.api.types.is_datetime64_any_dtype(frame[column]):
+                    frame[column] = frame[column].dt.strftime("%d %b %Y, %I:%M:%S %p")
+                elif frame[column].dtype == "object":
+                    frame[column] = frame[column].map(
+                        lambda value: value.tz_convert("Asia/Karachi").strftime("%d %b %Y, %I:%M:%S %p PKT")
+                        if isinstance(value, pd.Timestamp) and value.tzinfo is not None
+                        else (value.isoformat() if isinstance(value, (datetime, pd.Timestamp)) else value)
+                    )
             frame.to_excel(writer, sheet_name=name, index=False)
             sheet = writer.sheets[name]
             sheet.freeze_panes = "A2"
