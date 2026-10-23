@@ -7,10 +7,10 @@ import requests
 import streamlit as st
 import pydeck as pdk
 
-st.set_page_config(page_title="CCD | Admin V1.8", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="CCD | Admin V1.9", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
 st.markdown('''<style>.block-container{padding-top:1rem;max-width:1450px}h1,h2,h3{color:#084a82}div[data-testid="stMetric"]{border:1px solid #dce6ef;border-radius:12px;padding:12px;background:#f8fbff}div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px} .stButton>button[kind="primary"]{background:#00815d;border:0}@media(max-width:700px){.block-container{padding:0.7rem}.stDataFrame{font-size:12px}}</style>''', unsafe_allow_html=True)
 st.title("CUSTOMER CARE DAY")
-st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V1.8 | Pakistan Standard Time (PKT)")
+st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V1.9 | Pakistan Standard Time (PKT)")
 
 required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "ADMIN_PASSWORD"]
 missing = [key for key in required if not st.secrets.get(key)]
@@ -200,7 +200,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True)
 
-st.subheader("🗺️ Visit GPS map — V1.8")
+st.subheader("🗺️ Visit GPS map — V1.9")
 st.caption("Select one visit to compare its actual outlet, GPS IN and GPS OUT coordinates. Lines connect available recorded points only; they do not represent travel routes.")
 
 def find_geo_pair(columns, prefixes):
@@ -288,7 +288,7 @@ else:
             focus_choices.append("Focus on outlet")
         if "GPS IN" in by_role or "GPS OUT" in by_role:
             focus_choices.append("Focus on employee")
-        mode = st.radio("Map view", focus_choices, horizontal=True, key="gps_focus_v18")
+        mode = st.radio("Map view", focus_choices, horizontal=True, key="gps_focus_v19")
 
         # Zoom-to-fit uses longitude corrected for latitude, with conservative
         # padding for narrow mobile screens. Do not infer missing locations.
@@ -323,7 +323,7 @@ else:
                 p, q = by_role[first], by_role[second]
                 links.append({"source":[p["lon"],p["lat"]],
                               "target":[q["lon"],q["lat"]], "color":color})
-        # V1.8: visually group nearby IN/OUT points at wide-area zoom.
+        # V1.9: visually group nearby IN/OUT points at wide-area zoom.
         # The grouped marker is a display-only midpoint, never a replacement
         # for the true GPS coordinates stored in Supabase.
         from math import sin
@@ -341,7 +341,7 @@ else:
             value=True, disabled=not group_on_wide,
             help="Groups IN and OUT only in Show all locations when they are within 100 m. "
                  "Focus on employee always shows the true separate GPS points.",
-            key="gps_cluster_v18"
+            key="gps_cluster_v19"
         ) if group_on_wide else False
 
         if show_cluster:
@@ -379,7 +379,7 @@ else:
             map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
             initial_view_state=view, layers=layers,
             tooltip={"html":"<b>{role}</b><br/>{coordinates}<br/>Employee: {employee}<br/>Outlet: {outlet}"}),
-            use_container_width=True, key=f"ccd_gps_map_v18_{mode.replace(' ','_')}_{int(show_cluster)}")
+            use_container_width=True, key=f"ccd_gps_map_v19_{mode.replace(' ','_')}_{int(show_cluster)}")
         st.markdown("🟢 **Registered outlet** · 🔵 **GPS IN** · 🔴 **GPS OUT**" + (" · 🟣 **Grouped IN/OUT**" if show_cluster else ""))
         for p in pts:
             st.write(f"**{p['role']}:** `{p['coordinates']}`")
@@ -418,10 +418,83 @@ if not filtered.empty:
 else:
     outlet_report = pd.DataFrame(columns=["outlet_code", "outlet_name", "visits", "gps_mismatches", "avg_time_hours"])
 
-st.subheader("📍 GPS mismatch exceptions")
-exception_cols = ["Employee code", "Employee name", "Outlet code", "Outlet name", "IN (PKT)", "OUT (PKT)", "IN → outlet (m)", "OUT → outlet (m)", "IN → OUT (m)", "Outlet GPS status"]
-exceptions = shown.loc[mismatch, [c for c in exception_cols if c in shown.columns]]
-st.dataframe(exceptions, use_container_width=True, hide_index=True)
+st.subheader("🚨 GPS exception monitoring — V1.9")
+st.caption("An exception occurs when the recorded IN or OUT location is more than 1,500 metres from the registered outlet. "
+           "Distances are straight-line GPS measurements, not road distances. Uses the selected date, employee and outlet filters.")
+threshold_m = 1500.0
+in_distance = pd.to_numeric(filtered["in_outlet_distance_m"], errors="coerce")
+out_distance = pd.to_numeric(filtered["out_outlet_distance_m"], errors="coerce")
+in_exceeds = in_distance > threshold_m
+out_exceeds = out_distance > threshold_m
+exception_mask = in_exceeds | out_exceeds
+missing_distances = in_distance.isna() & out_distance.isna()
+exception_frame = filtered.loc[exception_mask].copy()
+exception_frame["IN exception"] = in_exceeds.loc[exception_mask].map({True: "Yes", False: "No"})
+exception_frame["OUT exception"] = out_exceeds.loc[exception_mask].map({True: "Yes", False: "No"})
+exception_frame["Maximum deviation (m)"] = pd.concat(
+    [in_distance.loc[exception_mask], out_distance.loc[exception_mask]], axis=1
+).max(axis=1).round(1)
+exception_frame["Deviation (km)"] = (exception_frame["Maximum deviation (m)"] / 1000).round(2)
+exception_frame["Exception type"] = [
+    "IN and OUT" if both_in and both_out else ("IN only" if both_in else "OUT only")
+    for both_in, both_out in zip(in_exceeds.loc[exception_mask], out_exceeds.loc[exception_mask])
+]
+exception_frame["IN time (PKT)"] = exception_frame["in_time_pkt"].dt.strftime("%d %b %Y %I:%M:%S %p").fillna("—")
+exception_frame["OUT time (PKT)"] = exception_frame["out_time_pkt"].dt.strftime("%d %b %Y %I:%M:%S %p").fillna("—")
+exception_frame = exception_frame.sort_values("Maximum deviation (m)", ascending=False)
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Exception visits", len(exception_frame))
+c2.metric("IN violations", int(in_exceeds.sum()))
+c3.metric("OUT violations", int(out_exceeds.sum()))
+if missing_distances.any():
+    st.warning(f"{int(missing_distances.sum())} visit(s) have neither IN nor OUT outlet-distance data; "
+               "these cannot be classified as compliant or non-compliant.")
+if not exception_frame.empty:
+    types = st.multiselect("Exception type", ["IN only", "OUT only", "IN and OUT"],
+                           default=["IN only", "OUT only", "IN and OUT"], key="exception_types_v19")
+    minimum_km = st.number_input("Minimum deviation to display (km)", min_value=1.5,
+                                 max_value=10000.0, value=1.5, step=0.5,
+                                 key="exception_minimum_v19")
+    visible_exceptions = exception_frame.loc[
+        exception_frame["Exception type"].isin(types)
+        & (exception_frame["Maximum deviation (m)"] > minimum_km * 1000 - 0.00001)
+    ].copy()
+    exception_columns = {
+        "employee_code": "Employee code", "employee_name": "Employee name",
+        "outlet_code": "Outlet code", "outlet_name": "Outlet name",
+        "IN time (PKT)": "IN (PKT)", "OUT time (PKT)": "OUT (PKT)",
+        "in_outlet_distance_m": "IN → outlet (m)",
+        "out_outlet_distance_m": "OUT → outlet (m)",
+        "Exception type": "Exception type",
+        "Maximum deviation (m)": "Maximum deviation (m)",
+        "Deviation (km)": "Deviation (km)",
+        "outlet_gps_status": "Reported GPS status", "visit_id": "Visit ID"
+    }
+    exceptions = visible_exceptions[
+        [col for col in exception_columns if col in visible_exceptions.columns]
+    ].rename(columns=exception_columns)
+    st.dataframe(exceptions, use_container_width=True, hide_index=True)
+    if not exceptions.empty:
+        exception_buffer = BytesIO()
+        with pd.ExcelWriter(exception_buffer, engine="openpyxl") as writer:
+            exceptions.to_excel(writer, sheet_name="GPS Exceptions", index=False)
+            worksheet = writer.sheets["GPS Exceptions"]
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+        st.download_button("⬇️ Download GPS exceptions (Excel)",
+                           data=exception_buffer.getvalue(),
+                           file_name=f"CCD_GPS_Exceptions_{now_pkt.isoformat()}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True)
+else:
+    exceptions = pd.DataFrame(columns=[
+        "Employee code", "Employee name", "Outlet code", "Outlet name",
+        "IN (PKT)", "OUT (PKT)", "IN → outlet (m)", "OUT → outlet (m)",
+        "Exception type", "Maximum deviation (m)", "Deviation (km)",
+        "Reported GPS status", "Visit ID"
+    ])
+    st.success("No GPS exceptions above 1.5 km in the selected visits.")
 
 @st.cache_data(show_spinner=False)
 def build_excel(visits_json, outlet_json, employee_json, exception_json):
@@ -442,6 +515,6 @@ def build_excel(visits_json, outlet_json, employee_json, exception_json):
 employee_export = employee_summary if not filtered.empty else pd.DataFrame(columns=["employee_code","employee_name","visits","completed","total_hours","gps_mismatches"])
 excel = build_excel(shown.to_json(orient="records"), outlet_report.to_json(orient="records"),
                     employee_export.to_json(orient="records"), exceptions.to_json(orient="records"))
-st.download_button("⬇️ Download Excel (4 sheets)", excel, file_name=f"CCD_Attendance_V1_7_{now_pkt.isoformat()}.xlsx",
+st.download_button("⬇️ Download Excel (4 sheets)", excel, file_name=f"CCD_Attendance_V1_9_{now_pkt.isoformat()}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
 st.caption("Read-only dashboard. GPS coordinates appear only if included in the Supabase attendance_visit_summary view. Never put server secrets in GitHub.")
