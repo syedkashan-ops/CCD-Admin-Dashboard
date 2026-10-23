@@ -10,7 +10,7 @@ import pydeck as pdk
 st.set_page_config(page_title="CCD | Admin V2.0", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
 st.markdown('''<style>.block-container{padding-top:1rem;max-width:1450px}h1,h2,h3{color:#084a82}div[data-testid="stMetric"]{border:1px solid #dce6ef;border-radius:12px;padding:12px;background:#f8fbff}div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px} .stButton>button[kind="primary"]{background:#00815d;border:0}@media(max-width:700px){.block-container{padding:0.7rem}.stDataFrame{font-size:12px}}</style>''', unsafe_allow_html=True)
 st.title("CUSTOMER CARE DAY")
-st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V2.0 | Pakistan Standard Time (PKT)")
+st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V2.8 | Pakistan Standard Time (PKT)")
 
 required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "ADMIN_PASSWORD"]
 missing = [key for key in required if not st.secrets.get(key)]
@@ -202,6 +202,75 @@ if truncated:
 if data.empty:
     st.info("No attendance visits have been recorded yet. The Outlet Master section above is still available.")
     st.stop()
+
+# V2.8 device audit: retrieve event-level identifiers with admin-only service key.
+# The visit summary view is unchanged; join by visit_id, not employee code.
+@st.cache_data(ttl=120, show_spinner=False)
+def load_device_audit():
+    headers = {"apikey": KEY, "Authorization": f"Bearer {KEY}"}
+    events = []
+    for offset in range(0, 100000, 1000):
+        response = requests.get(f"{BASE}/rest/v1/attendance_events", headers=headers,
+            params={"select":"visit_id,event_type,employee_code,device_id,android_id_hash,device_manufacturer,device_model", "order":"received_at.asc",
+                    "limit":1000, "offset":offset}, timeout=40)
+        response.raise_for_status()
+        chunk = response.json()
+        events.extend(chunk)
+        if len(chunk) < 1000:
+            return pd.DataFrame(events), False
+    return pd.DataFrame(events), True
+
+try:
+    audit_events, audit_truncated = load_device_audit()
+except Exception as exc:
+    st.error(f"Device audit unavailable. Apply V2.8 migration first: {exc}")
+    st.stop()
+if audit_truncated:
+    st.warning("Device audit truncated at 100,000 events; device counts may be incomplete.")
+if "visit_id" not in data.columns:
+    st.error("The attendance visit summary must expose visit_id for device audit. No inferred joins will be made.")
+    st.stop()
+if audit_events.empty:
+    audit_events = pd.DataFrame(columns=["visit_id", "event_type", "employee_code", "device_id", "android_id_hash", "device_manufacturer", "device_model"])
+for col in ("visit_id", "event_type", "employee_code", "device_id", "android_id_hash", "device_manufacturer", "device_model"):
+    if col not in audit_events.columns:
+        audit_events[col] = ""
+audit_events["device_id"] = audit_events["device_id"].fillna("").astype(str)
+valid_events = audit_events.loc[audit_events["device_id"].str.startswith("CCD-")].copy()
+# Across the fetched dataset, not only currently filtered visits.
+device_employee_counts = valid_events.groupby("device_id")["employee_code"].nunique().to_dict()
+visit_devices = valid_events.groupby("visit_id")["device_id"].agg(lambda ids: sorted(set(ids))).to_dict()
+data["Device ID"] = data["visit_id"].map(lambda vid: ", ".join(visit_devices.get(vid, [])) or "Not recorded (older app)")
+data["Distinct Employees on Device"] = data["visit_id"].map(
+    lambda vid: max((device_employee_counts.get(dev, 0) for dev in visit_devices.get(vid, [])), default=0))
+data["Device Audit Status"] = data["visit_id"].map(
+    lambda vid: "IN/OUT device mismatch" if len(visit_devices.get(vid, [])) > 1
+    else "Review — shared device" if any(device_employee_counts.get(dev, 0) > 1 for dev in visit_devices.get(vid, []))
+    else "Normal" if visit_devices.get(vid, []) else "Not available")
+
+# Additional device metadata (pseudonymous Android ID hash, manufacturer, model).
+for field in ("android_id_hash", "device_manufacturer", "device_model"):
+    audit_events[field] = audit_events[field].fillna("").astype(str)
+
+def visit_metadata(field):
+    return audit_events.groupby("visit_id")[field].agg(
+        lambda vals: ", ".join(sorted({v for v in vals if v}))
+    ).to_dict()
+
+for source, target in (("android_id_hash", "Android ID Hash"),
+                       ("device_manufacturer", "Device Manufacturer"),
+                       ("device_model", "Device Model")):
+    mapping = visit_metadata(source)
+    data[target] = data["visit_id"].map(lambda vid: mapping.get(vid, "") or "Not recorded")
+# Correlate reinstallations cautiously: Android ID may change on factory reset/signing-key changes.
+valid_hash = audit_events.loc[audit_events["android_id_hash"].str.fullmatch(r"[0-9a-f]{64}")].copy()
+hash_employee_counts = valid_hash.groupby("android_id_hash")["employee_code"].nunique().to_dict()
+visit_hashes = valid_hash.groupby("visit_id")["android_id_hash"].agg(lambda vals: sorted(set(vals))).to_dict()
+data["Distinct Employees on Android ID"] = data["visit_id"].map(
+    lambda vid: max((hash_employee_counts.get(h, 0) for h in visit_hashes.get(vid, [])), default=0))
+data["Device Audit Status"] = data.apply(
+    lambda r: "Review — shared Android ID" if r["Distinct Employees on Android ID"] > 1
+    and r["Device Audit Status"] in ("Normal", "Not available") else r["Device Audit Status"], axis=1)
 
 # The V1.2 summary is the source of truth. Do not fabricate unavailable GPS coordinates.
 for field in ("in_time", "out_time"):
@@ -669,12 +738,22 @@ else:
     ])
     st.success("No GPS exceptions above 1.5 km in the selected visits.")
 
+st.subheader("📱 Shared Device Attendance Audit")
+st.caption("Device ID and hashed Android ID are audit signals, not IMEI or proof of impersonation. Reinstalling, resetting, or signing changes can alter identifiers. Restrict report access.")
+shared_visits = filtered.loc[filtered["Device Audit Status"].isin(["Review — shared device", "Review — shared Android ID", "IN/OUT device mismatch"])].copy()
+st.metric("Visits requiring device review (selected filters)", len(shared_visits))
+if not shared_visits.empty:
+    audit_cols = [c for c in ["employee_code", "employee_name", "outlet_code", "visit_id", "Device ID", "Android ID Hash", "Device Manufacturer", "Device Model", "Distinct Employees on Device", "Distinct Employees on Android ID", "Device Audit Status", "in_time_pkt", "out_time_pkt"] if c in shared_visits.columns]
+    st.dataframe(shared_visits[audit_cols], use_container_width=True, hide_index=True)
+else:
+    st.info("No shared-device flags among selected visits. Older-app records without a Device ID cannot be assessed.")
+
 @st.cache_data(show_spinner=False)
-def build_excel(visits_json, outlet_json, employee_json, exception_json):
+def build_excel(visits_json, outlet_json, employee_json, exception_json, audit_json):
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for name, content in [("Employee Visits", visits_json), ("Outlet Summary", outlet_json),
-                              ("Employee Summary", employee_json), ("GPS Exceptions", exception_json)]:
+                              ("Employee Summary", employee_json), ("GPS Exceptions", exception_json), ("Device Audit", audit_json)]:
             frame = pd.read_json(BytesIO(content.encode()), orient="records")
             frame.to_excel(writer, sheet_name=name, index=False)
             sheet = writer.sheets[name]
@@ -687,7 +766,8 @@ def build_excel(visits_json, outlet_json, employee_json, exception_json):
 
 employee_export = employee_summary if not filtered.empty else pd.DataFrame(columns=["employee_code","employee_name","visits","completed","total_hours","gps_mismatches"])
 excel = build_excel(shown.to_json(orient="records"), outlet_report.to_json(orient="records"),
-                    employee_export.to_json(orient="records"), exceptions.to_json(orient="records"))
-st.download_button("⬇️ Download Excel (4 sheets)", excel, file_name=f"CCD_Attendance_V2_0_{now_pkt.isoformat()}.xlsx",
+                    employee_export.to_json(orient="records"), exceptions.to_json(orient="records"),
+                    shared_visits.to_json(orient="records", date_format="iso"))
+st.download_button("⬇️ Download Excel (5 sheets)", excel, file_name=f"CCD_Attendance_Device_Audit_V2_8_{now_pkt.isoformat()}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
 st.caption("Attendance reporting is read-only. Outlet Master edits require administrator confirmation. Never put server secrets in GitHub.")
