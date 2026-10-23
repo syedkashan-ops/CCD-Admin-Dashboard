@@ -5,11 +5,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import streamlit as st
+import pydeck as pdk
 
-st.set_page_config(page_title="CCD | Admin V1.4", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="CCD | Admin V1.5", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
 st.markdown('''<style>.block-container{padding-top:1rem;max-width:1450px}h1,h2,h3{color:#084a82}div[data-testid="stMetric"]{border:1px solid #dce6ef;border-radius:12px;padding:12px;background:#f8fbff}div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px} .stButton>button[kind="primary"]{background:#00815d;border:0}@media(max-width:700px){.block-container{padding:0.7rem}.stDataFrame{font-size:12px}}</style>''', unsafe_allow_html=True)
 st.title("CUSTOMER CARE DAY")
-st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V1.4 | Pakistan Standard Time (PKT)")
+st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V1.5 | Pakistan Standard Time (PKT)")
 
 required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "ADMIN_PASSWORD"]
 missing = [key for key in required if not st.secrets.get(key)]
@@ -175,6 +176,76 @@ if not filtered.empty:
             st.write(f"**Outlet distance (IN / OUT):** {r.get('in_outlet_distance_m',float('nan'))} m / {r.get('out_outlet_distance_m',float('nan'))} m")
             st.write(f"**IN → OUT distance:** {r.get('in_out_distance_m',float('nan'))} m")
 
+# V1.5: selected employee history, using exactly the same filtered data as the main report.
+st.subheader("🕘 Employee attendance history")
+if filtered.empty:
+    st.info("No employee visits available for the selected filters.")
+else:
+    people = (filtered[["employee_code", "employee_name"]].drop_duplicates()
+              .fillna("").astype(str).sort_values(["employee_name", "employee_code"]))
+    person_labels = {f"{r.employee_code} — {r.employee_name}": (r.employee_code, r.employee_name)
+                     for r in people.itertuples(index=False)}
+    chosen_label = st.selectbox("Select an employee to view attendance history", list(person_labels))
+    chosen_code, chosen_name = person_labels[chosen_label]
+    history_mask = (filtered["employee_code"].astype(str).eq(chosen_code) &
+                    filtered["employee_name"].astype(str).eq(chosen_name))
+    history = shown.loc[history_mask].copy()
+    st.metric("Visits for selected employee", len(history))
+    st.dataframe(history, use_container_width=True, hide_index=True)
+    history_buf = BytesIO()
+    with pd.ExcelWriter(history_buf, engine="openpyxl") as writer:
+        history.to_excel(writer, sheet_name="Employee History", index=False)
+    st.download_button("⬇️ Download selected employee history", history_buf.getvalue(),
+        file_name=f"CCD_Employee_{chosen_code}_History.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True)
+
+st.subheader("🗺️ Visit GPS map")
+st.caption("The map uses actual coordinates returned by Supabase; it does not infer locations from distances.")
+
+def find_geo_pair(columns, prefixes):
+    """Find a known latitude/longitude pair; do not guess from unrelated fields."""
+    names = {str(c).lower(): c for c in columns}
+    for prefix in prefixes:
+        for lat_suffix, lon_suffix in (("lat", "lon"), ("latitude", "longitude"),
+                                       ("lat", "lng"), ("latitude", "lng")):
+            a, b = prefix + lat_suffix, prefix + lon_suffix
+            if a in names and b in names:
+                return names[a], names[b]
+    return None
+
+map_points = []
+map_roles = [
+    ("Registered outlet", ["outlet_", "station_", "site_"], [20, 100, 210]),
+    ("GPS IN", ["in_", "gps_in_", "in_gps_"], [0, 155, 100]),
+    ("GPS OUT", ["out_", "gps_out_", "out_gps_"], [220, 100, 20]),
+]
+for label, prefixes, rgb in map_roles:
+    pair = find_geo_pair(filtered.columns, prefixes)
+    if pair:
+        lat_col, lon_col = pair
+        for _, rec in filtered.iterrows():
+            lat = pd.to_numeric(rec.get(lat_col), errors="coerce")
+            lon = pd.to_numeric(rec.get(lon_col), errors="coerce")
+            if pd.notna(lat) and pd.notna(lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
+                map_points.append({"lat":float(lat), "lon":float(lon), "role":label,
+                                   "employee":str(rec.get("employee_name", "")),
+                                   "outlet":str(rec.get("outlet_code", "")), "color":rgb})
+if map_points:
+    point_df = pd.DataFrame(map_points)
+    st.pydeck_chart(pdk.Deck(
+        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+        initial_view_state=pdk.ViewState(latitude=float(point_df.lat.mean()),
+            longitude=float(point_df.lon.mean()), zoom=11, pitch=0),
+        layers=[pdk.Layer("ScatterplotLayer", data=point_df, get_position="[lon, lat]",
+            get_fill_color="color", get_radius=75, radius_min_pixels=6,
+            pickable=True, stroked=True, get_line_color=[255,255,255])],
+        tooltip={"html":"<b>{role}</b><br/>Employee: {employee}<br/>Outlet: {outlet}"}),
+        use_container_width=True)
+    st.caption("Blue: registered outlet · Green: GPS IN · Orange: GPS OUT. Only available coordinates are plotted.")
+else:
+    st.info("GPS map unavailable: the existing attendance_visit_summary view does not expose recognized latitude/longitude pairs. Attendance reporting remains fully functional. To enable the map, add outlet, IN and OUT coordinate columns to that view after confirming their database field names.")
+
 st.subheader("🏪 Outlet-wise visits")
 if not filtered.empty:
     outlet_report = filtered.groupby(["outlet_code", "outlet_name"], dropna=False).agg(
@@ -211,6 +282,6 @@ def build_excel(visits_json, outlet_json, employee_json, exception_json):
 employee_export = employee_summary if not filtered.empty else pd.DataFrame(columns=["employee_code","employee_name","visits","completed","total_hours","gps_mismatches"])
 excel = build_excel(shown.to_json(orient="records"), outlet_report.to_json(orient="records"),
                     employee_export.to_json(orient="records"), exceptions.to_json(orient="records"))
-st.download_button("⬇️ Download Excel (4 sheets)", excel, file_name=f"CCD_Attendance_V1_4_{now_pkt.isoformat()}.xlsx",
+st.download_button("⬇️ Download Excel (4 sheets)", excel, file_name=f"CCD_Attendance_V1_5_{now_pkt.isoformat()}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
 st.caption("Read-only dashboard. GPS coordinates appear only if included in the Supabase attendance_visit_summary view. Never put server secrets in GitHub.")
