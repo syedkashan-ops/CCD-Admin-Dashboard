@@ -7,10 +7,10 @@ import requests
 import streamlit as st
 import pydeck as pdk
 
-st.set_page_config(page_title="CCD | Admin V1.9", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="CCD | Admin V2.0", page_icon="📍", layout="wide", initial_sidebar_state="collapsed")
 st.markdown('''<style>.block-container{padding-top:1rem;max-width:1450px}h1,h2,h3{color:#084a82}div[data-testid="stMetric"]{border:1px solid #dce6ef;border-radius:12px;padding:12px;background:#f8fbff}div[data-testid="stVerticalBlockBorderWrapper"]{border-radius:12px} .stButton>button[kind="primary"]{background:#00815d;border:0}@media(max-width:700px){.block-container{padding:0.7rem}.stDataFrame{font-size:12px}}</style>''', unsafe_allow_html=True)
 st.title("CUSTOMER CARE DAY")
-st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V1.9 | Pakistan Standard Time (PKT)")
+st.caption("WE CARE. YOU DRIVE. | Admin Dashboard V2.0 | Pakistan Standard Time (PKT)")
 
 required = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "ADMIN_PASSWORD"]
 missing = [key for key in required if not st.secrets.get(key)]
@@ -43,6 +43,140 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+# V2.0 — authorized administrator master upload. The database remains the
+# source of truth. No upload is committed until preview and confirmation.
+st.subheader("📍 Outlet GPS Master")
+st.caption("Upload an Excel (.xlsx) or CSV master with Code, Name, Latitude and Longitude. "
+           "Existing outlet codes are updated; new codes are added. Missing codes are never deleted.")
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_outlet_master():
+    headers = {"apikey": KEY, "Authorization": f"Bearer {KEY}"}
+    result = []
+    for offset in range(0, 100000, 1000):
+        response = requests.get(f"{BASE}/rest/v1/outlets", headers=headers,
+            params={"select":"code,name,latitude,longitude",
+                    "order":"code.asc", "limit":1000, "offset":offset}, timeout=30)
+        response.raise_for_status()
+        page = response.json()
+        result.extend(page)
+        if len(page) < 1000:
+            return pd.DataFrame(result)
+    raise RuntimeError("Outlet Master exceeds 100,000 rows; upload disabled until pagination is extended.")
+
+def normalize_outlet_master(upload):
+    if upload.name.lower().endswith(".csv"):
+        raw = pd.read_csv(upload, dtype=str, keep_default_na=False)
+    else:
+        raw = pd.read_excel(upload, dtype=str, engine="openpyxl", keep_default_na=False)
+    raw.columns = [str(c).strip().lower().replace(" ", "_") for c in raw.columns]
+    aliases = {"outlet_code":"code", "outlet_name":"name", "lat":"latitude",
+               "lattitude":"latitude", "lon":"longitude", "long":"longitude",
+               "lng":"longitude", "langitude":"longitude"}
+    raw = raw.rename(columns={c:aliases.get(c,c) for c in raw.columns})
+    required_cols = ["code","name","latitude","longitude"]
+    if any(list(raw.columns).count(c) != 1 for c in required_cols):
+        raise ValueError("File must have exactly one column each for Code, Name, Latitude, Longitude.")
+    master = raw[required_cols].copy()
+    master["code"] = master["code"].astype(str).str.strip()
+    master["name"] = master["name"].astype(str).str.strip()
+    # Avoid accepting numeric codes accidentally converted to 114723.0
+    master["code"] = master["code"].str.replace(r"\\.0$", "", regex=True)
+    master["latitude"] = pd.to_numeric(master["latitude"], errors="coerce")
+    master["longitude"] = pd.to_numeric(master["longitude"], errors="coerce")
+    issues = []
+    for idx, r in master.iterrows():
+        errors = []
+        if not r["code"] or not r["code"].isdigit():
+            errors.append("Code must contain digits")
+        if not r["name"] or len(r["name"]) > 200:
+            errors.append("Name is blank or too long")
+        if pd.isna(r["latitude"]) or not -90 <= r["latitude"] <= 90:
+            errors.append("Invalid latitude")
+        if pd.isna(r["longitude"]) or not -180 <= r["longitude"] <= 180:
+            errors.append("Invalid longitude")
+        if errors:
+            issues.append({"Excel row": idx+2, "Code": r["code"], "Issue": "; ".join(errors)})
+    duplicated = master["code"].duplicated(keep=False)
+    for idx, r in master.loc[duplicated].iterrows():
+        issues.append({"Excel row":idx+2, "Code":r["code"], "Issue":"Duplicate code in upload"})
+    return master, pd.DataFrame(issues)
+
+with st.expander("📤 Upload / update Outlet Master", expanded=False):
+    try:
+        current_master = load_outlet_master()
+        st.caption(f"Current registered outlets: {len(current_master):,}")
+        st.dataframe(current_master, use_container_width=True, hide_index=True)
+        current_excel = BytesIO()
+        with pd.ExcelWriter(current_excel, engine="openpyxl") as writer:
+            current_master.to_excel(writer, sheet_name="Outlet Master", index=False)
+        st.download_button("⬇️ Download current master", current_excel.getvalue(),
+            file_name="CCD_Outlet_Master_Current.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        master_available = True
+    except Exception as exc:
+        st.error(f"Cannot retrieve Outlet Master: {exc}")
+        master_available = False
+        current_master = pd.DataFrame(columns=["code","name","latitude","longitude"])
+
+    template = BytesIO()
+    with pd.ExcelWriter(template, engine="openpyxl") as writer:
+        pd.DataFrame([{"Code":"114723", "Name":"Test Outlet 114723",
+                       "Latitude":24.8912, "Longitude":67.07735}]).to_excel(
+                           writer, sheet_name="Outlet Master", index=False)
+    st.download_button("⬇️ Download Excel master template", template.getvalue(),
+        file_name="CCD_Outlet_Master_Template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    upload = st.file_uploader("Select master file", type=["xlsx","csv"], key="outlet_master_v20")
+    if upload is not None and master_available:
+        if upload.size > 5_000_000:
+            st.error("File exceeds 5 MB. Split it into smaller uploads.")
+        else:
+            try:
+                proposed, issues = normalize_outlet_master(upload)
+                st.write(f"**Rows received:** {len(proposed):,}")
+                if proposed.empty:
+                    st.error("The uploaded file contains no outlet records.")
+                elif not issues.empty:
+                    st.error("Upload blocked. Correct the following errors and upload again.")
+                    st.dataframe(issues, use_container_width=True, hide_index=True)
+                else:
+                    existing_codes = set(current_master["code"].astype(str))
+                    proposed["Action"] = proposed["code"].map(
+                        lambda c: "Update existing" if c in existing_codes else "Add new")
+                    st.metric("New outlets", int((proposed["Action"]=="Add new").sum()))
+                    st.metric("Existing outlets to update", int((proposed["Action"]=="Update existing").sum()))
+                    st.dataframe(proposed, use_container_width=True, hide_index=True)
+                    st.warning("Confirming will overwrite the name and GPS coordinates of matching outlet codes. "
+                               "Existing attendance records are not deleted. Historical distance calculations "
+                               "may change because the reporting view joins the current outlet master.")
+                    confirm = st.checkbox("I have reviewed the master and approve these changes",
+                                          key="confirm_outlet_master_v20")
+                    if st.button("Apply outlet master to Supabase", type="primary",
+                                 disabled=not confirm, key="apply_outlet_master_v20"):
+                        payload = proposed[["code","name","latitude","longitude"]].to_dict("records")
+                        headers = {"apikey":KEY, "Authorization":f"Bearer {KEY}",
+                                   "Content-Type":"application/json",
+                                   "Prefer":"resolution=merge-duplicates,return=minimal"}
+                        # Small batches prevent oversized requests; report partial failures explicitly.
+                        succeeded = 0
+                        for begin in range(0,len(payload),100):
+                            batch = payload[begin:begin+100]
+                            response = requests.post(f"{BASE}/rest/v1/outlets",
+                                headers=headers, params={"on_conflict":"code"},
+                                json=batch, timeout=40)
+                            if not response.ok:
+                                st.error(f"Upload stopped after {succeeded} records. "
+                                         f"Supabase HTTP {response.status_code}: {response.text[:300]}")
+                                break
+                            succeeded += len(batch)
+                        if succeeded == len(payload):
+                            st.success(f"Outlet Master synchronized successfully: {succeeded} records.")
+                        if succeeded:
+                            st.cache_data.clear()
+            except Exception as exc:
+                st.error(f"Could not process master file: {exc}")
+
 @st.cache_data(ttl=120, show_spinner="Loading attendance visits...")
 def load_visits():
     headers = {"apikey": KEY, "Authorization": f"Bearer {KEY}", "Accept": "application/json"}
@@ -66,7 +200,7 @@ except Exception as exc:
 if truncated:
     st.warning("First 100,000 visits loaded. Server-side pagination is needed for a larger dataset.")
 if data.empty:
-    st.info("No attendance visits have been recorded yet.")
+    st.info("No attendance visits have been recorded yet. The Outlet Master section above is still available.")
     st.stop()
 
 # The V1.2 summary is the source of truth. Do not fabricate unavailable GPS coordinates.
@@ -150,6 +284,45 @@ rename = {"employee_code":"Employee code", "employee_name":"Employee name", "out
           "in_accuracy_m":"IN accuracy (m)", "out_accuracy_m":"OUT accuracy (m)", "visit_id":"Visit ID"}
 shown = shown.rename(columns=rename)
 
+st.subheader("📊 Management performance summary — V2.0")
+st.caption("Compliance is based on recorded GPS distances. Missing GPS distances are shown separately, "
+           "not assumed compliant. All figures respect the attendance filters.")
+if not filtered.empty:
+    overview = filtered.copy()
+    overview["completed_visit"] = overview["in_time"].notna() & overview["out_time"].notna()
+    overview["in_distance_value"] = pd.to_numeric(overview["in_outlet_distance_m"], errors="coerce")
+    overview["out_distance_value"] = pd.to_numeric(overview["out_outlet_distance_m"], errors="coerce")
+    overview["gps_violation"] = ((overview["in_distance_value"] > 1500) |
+                                  (overview["out_distance_value"] > 1500))
+    overview["gps_unverified"] = overview["in_distance_value"].isna() | overview["out_distance_value"].isna()
+    overview["gps_compliant"] = (~overview["gps_violation"]) & (~overview["gps_unverified"])
+    mg1,mg2,mg3 = st.columns(3)
+    mg1.metric("GPS compliant visits", int(overview["gps_compliant"].sum()))
+    mg2.metric("GPS violations", int(overview["gps_violation"].sum()))
+    mg3.metric("GPS unverified", int(overview["gps_unverified"].sum()))
+    grouped = overview.groupby(["outlet_code","outlet_name"], dropna=False).agg(
+        visits=("employee_code","size"),
+        completed=("completed_visit","sum"),
+        incomplete=("completed_visit",lambda a:int((~a).sum())),
+        gps_compliant=("gps_compliant","sum"),
+        gps_violations=("gps_violation","sum"),
+        gps_unverified=("gps_unverified","sum"),
+        unique_employees=("employee_code","nunique")
+    ).reset_index()
+    grouped["GPS compliance (%)"] = (100*grouped["gps_compliant"]/grouped["visits"]).round(1)
+    grouped["Completion (%)"] = (100*grouped["completed"]/grouped["visits"]).round(1)
+    grouped = grouped.sort_values(["gps_violations","incomplete","visits"],ascending=[False,False,False])
+    st.dataframe(grouped, use_container_width=True, hide_index=True)
+    summary_buffer = BytesIO()
+    with pd.ExcelWriter(summary_buffer, engine="openpyxl") as writer:
+        grouped.to_excel(writer, sheet_name="Outlet Management", index=False)
+        writer.sheets["Outlet Management"].freeze_panes="A2"
+    st.download_button("⬇️ Download management summary (Excel)",summary_buffer.getvalue(),
+        file_name=f"CCD_Management_Summary_{now_pkt.isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+else:
+    st.info("No visits match the filters.")
+
 st.subheader("👤 Employee-wise attendance")
 if filtered.empty:
     st.info("No visits match the selected filters.")
@@ -200,7 +373,7 @@ else:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True)
 
-st.subheader("🗺️ Visit GPS map — V1.9")
+st.subheader("🗺️ Visit GPS map — V2.0")
 st.caption("Select one visit to compare its actual outlet, GPS IN and GPS OUT coordinates. Lines connect available recorded points only; they do not represent travel routes.")
 
 def find_geo_pair(columns, prefixes):
@@ -288,7 +461,7 @@ else:
             focus_choices.append("Focus on outlet")
         if "GPS IN" in by_role or "GPS OUT" in by_role:
             focus_choices.append("Focus on employee")
-        mode = st.radio("Map view", focus_choices, horizontal=True, key="gps_focus_v19")
+        mode = st.radio("Map view", focus_choices, horizontal=True, key="gps_focus_v20")
 
         # Zoom-to-fit uses longitude corrected for latitude, with conservative
         # padding for narrow mobile screens. Do not infer missing locations.
@@ -323,7 +496,7 @@ else:
                 p, q = by_role[first], by_role[second]
                 links.append({"source":[p["lon"],p["lat"]],
                               "target":[q["lon"],q["lat"]], "color":color})
-        # V1.9: visually group nearby IN/OUT points at wide-area zoom.
+        # V2.0: visually group nearby IN/OUT points at wide-area zoom.
         # The grouped marker is a display-only midpoint, never a replacement
         # for the true GPS coordinates stored in Supabase.
         from math import sin
@@ -341,7 +514,7 @@ else:
             value=True, disabled=not group_on_wide,
             help="Groups IN and OUT only in Show all locations when they are within 100 m. "
                  "Focus on employee always shows the true separate GPS points.",
-            key="gps_cluster_v19"
+            key="gps_cluster_v20"
         ) if group_on_wide else False
 
         if show_cluster:
@@ -379,7 +552,7 @@ else:
             map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
             initial_view_state=view, layers=layers,
             tooltip={"html":"<b>{role}</b><br/>{coordinates}<br/>Employee: {employee}<br/>Outlet: {outlet}"}),
-            use_container_width=True, key=f"ccd_gps_map_v19_{mode.replace(' ','_')}_{int(show_cluster)}")
+            use_container_width=True, key=f"ccd_gps_map_v20_{mode.replace(' ','_')}_{int(show_cluster)}")
         st.markdown("🟢 **Registered outlet** · 🔵 **GPS IN** · 🔴 **GPS OUT**" + (" · 🟣 **Grouped IN/OUT**" if show_cluster else ""))
         for p in pts:
             st.write(f"**{p['role']}:** `{p['coordinates']}`")
@@ -418,7 +591,7 @@ if not filtered.empty:
 else:
     outlet_report = pd.DataFrame(columns=["outlet_code", "outlet_name", "visits", "gps_mismatches", "avg_time_hours"])
 
-st.subheader("🚨 GPS exception monitoring — V1.9")
+st.subheader("🚨 GPS exception monitoring — V2.0")
 st.caption("An exception occurs when the recorded IN or OUT location is more than 1,500 metres from the registered outlet. "
            "Distances are straight-line GPS measurements, not road distances. Uses the selected date, employee and outlet filters.")
 threshold_m = 1500.0
@@ -452,10 +625,10 @@ if missing_distances.any():
                "these cannot be classified as compliant or non-compliant.")
 if not exception_frame.empty:
     types = st.multiselect("Exception type", ["IN only", "OUT only", "IN and OUT"],
-                           default=["IN only", "OUT only", "IN and OUT"], key="exception_types_v19")
+                           default=["IN only", "OUT only", "IN and OUT"], key="exception_types_v20")
     minimum_km = st.number_input("Minimum deviation to display (km)", min_value=1.5,
                                  max_value=10000.0, value=1.5, step=0.5,
-                                 key="exception_minimum_v19")
+                                 key="exception_minimum_v20")
     visible_exceptions = exception_frame.loc[
         exception_frame["Exception type"].isin(types)
         & (exception_frame["Maximum deviation (m)"] > minimum_km * 1000 - 0.00001)
@@ -515,6 +688,6 @@ def build_excel(visits_json, outlet_json, employee_json, exception_json):
 employee_export = employee_summary if not filtered.empty else pd.DataFrame(columns=["employee_code","employee_name","visits","completed","total_hours","gps_mismatches"])
 excel = build_excel(shown.to_json(orient="records"), outlet_report.to_json(orient="records"),
                     employee_export.to_json(orient="records"), exceptions.to_json(orient="records"))
-st.download_button("⬇️ Download Excel (4 sheets)", excel, file_name=f"CCD_Attendance_V1_9_{now_pkt.isoformat()}.xlsx",
+st.download_button("⬇️ Download Excel (4 sheets)", excel, file_name=f"CCD_Attendance_V2_0_{now_pkt.isoformat()}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
-st.caption("Read-only dashboard. GPS coordinates appear only if included in the Supabase attendance_visit_summary view. Never put server secrets in GitHub.")
+st.caption("Attendance reporting is read-only. Outlet Master edits require administrator confirmation. Never put server secrets in GitHub.")
